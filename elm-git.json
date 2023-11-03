@@ -1,0 +1,5 @@
+{
+    "git-dependencies": {
+        "git@github.com:staeter/identifiable-data.git": "1.0.0 <= v < 2.0.0"
+    }
+}
