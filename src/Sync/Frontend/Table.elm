@@ -136,10 +136,10 @@ get (Ulid ulid) (Table _ table) =
 isLoading : Ulid v -> Table v -> Bool
 isLoading (Ulid ulid) (Table _ table) =
     Dict.get ulid table
-        |> Maybe.map (\value ->
-            value.remote == Loading
-            || not (IdDict.isEmpty value.local)
-        )
+        |> Maybe.map
+            (\value ->
+                value.remote == Loading || not (IdDict.isEmpty value.local)
+            )
         |> Maybe.withDefault False
 
 

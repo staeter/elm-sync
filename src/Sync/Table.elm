@@ -5,11 +5,13 @@ import Id exposing (Id)
 import Random.NoOpaqueType as Random
 import Maybe.Extra
 
+
 type Operation v
     = Read
     | Create v
     | Update v
     | Delete
+
 
 type ToBackend v
     = ToBackend
@@ -17,11 +19,13 @@ type ToBackend v
         , operations : List (Ulid v, Id (Operation v), Operation v)
         }
 
+
 type ToFrontend v
     = ToFrontend
         { newSeed : Maybe Random.Seed
         , operations : List (Ulid v, Validation v, Operation v)
         }
+
 
 type Validation v
     = Accepted (Id (Operation v))
@@ -51,3 +55,9 @@ batchToFrontend =
         )
         { newSeed = Nothing, operations = []}
         >> ToFrontend
+
+
+-- lamdera
+
+type alias ClientId = String
+type alias SessionId = String

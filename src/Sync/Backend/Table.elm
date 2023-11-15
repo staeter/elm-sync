@@ -8,17 +8,21 @@ import IdSet exposing (IdSet)
 import Random.NoOpaqueType as Random
 import Id exposing (Id(..))
 
+
 type Table user v
     = Table Random.Seed (Dict String (Value user v))
 
+
 type alias Value user v =
     { value : Maybe v
-    , writer : IdSet user
-    , reader : IdSet user
+    , writers : IdSet user
+    , readers : IdSet user
     }
+
 
 type alias NeedProcessing v =
     { response : ToFrontend v
+    , addToListening : UlidSet v
     , changes : UlidSet v
     }
 
@@ -36,13 +40,14 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
                     ( Dict.insert
                         ulid
                         { value = Just sainVal
-                        , writer = IdSet.singleton userId
-                        , reader = IdSet.empty
+                        , writers = IdSet.singleton userId
+                        , readers = IdSet.empty
                         }
                         table
                         |> Table seed
                     , { response = insertToFront (Ulid ulid, Accepted opId, Create sainVal) needProc.response
                       , changes = UlidSet.insert (Ulid ulid) needProc.changes
+                      , addToListening = UlidSet.insert (Ulid ulid) needProc.addToListening
                       }
                     )
 
@@ -62,6 +67,7 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
                         | response =
                             { operations = (Ulid ulid, Rejected opId, op) :: toFrontend.operations
                             , newSeed = Just newFrontSeed
+                            , addToListening = UlidSet.empty
                             } |> ToFrontend
                         }
                     )
@@ -70,13 +76,14 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
                     if value.value == Nothing then
                         noVal (Ulid ulid, opId, op) (Table seed table, needProc)
 
-                    else if IdSet.member userId value.writer then
+                    else if IdSet.member userId value.writers then
                         let
                             sainVal = sanitize newVal
                         in
                         ( Dict.insert ulid { value | value = Just sainVal } table |> Table seed
                         , { response = insertToFront (Ulid ulid, Accepted opId, Update sainVal) needProc.response
                           , changes = UlidSet.insert (Ulid ulid) needProc.changes
+                          , addToListening = UlidSet.insert (Ulid ulid) needProc.addToListening
                           }
                         )
 
@@ -89,15 +96,16 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
                     if value.value == Nothing then
                         noVal (Ulid ulid, opId, op) (Table seed table, needProc)
 
-                    else if IdSet.member userId value.writer then
-                        ( Dict.insert ulid { value = Nothing, writer = IdSet.empty, reader = IdSet.empty } table
+                    else if IdSet.member userId value.writers then
+                        ( Dict.insert ulid { value = Nothing, writers = IdSet.empty, readers = IdSet.empty } table
                             |> Table seed
                         , { response = insertToFront (Ulid ulid, Accepted opId, Delete) needProc.response
                           , changes = UlidSet.insert (Ulid ulid) needProc.changes
+                          , addToListening = UlidSet.insert (Ulid ulid) needProc.addToListening
                           }
                         )
 
-                    else if IdSet.member userId value.reader then
+                    else if IdSet.member userId value.readers then
                         ( Table seed table
                         , { needProc | response = insertToFront (Ulid ulid, Rejected opId, op) needProc.response }
                         )
@@ -111,9 +119,12 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
                             noVal (Ulid ulid, opId, op) (Table seed table, needProc)
 
                         Just val ->
-                            if IdSet.member userId value.reader || IdSet.member userId value.writer then
+                            if IdSet.member userId value.readers || IdSet.member userId value.writers then
                                 ( Table seed table
-                                , { needProc | response = insertToFront (Ulid ulid, Accepted opId, Update val ) needProc.response }
+                                , { needProc
+                                  | response = insertToFront (Ulid ulid, Accepted opId, Update val ) needProc.response
+                                  , addToListening = UlidSet.insert (Ulid ulid) needProc.addToListening
+                                  }
                                 )
 
                             else
@@ -136,21 +147,49 @@ fromFrontend sanitize userId (ToBackend toBackend) myTable =
         (List.sortBy (\(_, Id opId, _) -> opId) toBackend.operations)
 
 
+forwardChanges : Id user -> UlidSet v -> NeedProcessing v -> Table user v -> Maybe (ToFrontend v)
+forwardChanges userId listening {changes} table =
+    let
+        operations =
+            UlidSet.foldl
+                (\listeningId opAcc->
+                    if not UlidSet.member listeningId changes then
+                        opAcc
+                    else
+                        case get userId listeningId table |> Maybe.andThen .value of
+                            Nothing ->
+                                (listeningId, External, Delete ) :: opAcc
+
+                            Just val ->
+                                (listeningId, External, Update val ) :: opAcc
+                )
+                []
+                listening
+    in
+    if List.isEmpty operations then
+        Nothing
+
+    else
+        { operations = operations, newSeed = Nothing }
+            |> ToFrontend |> Just
+
+
 genSeed : Table user v -> (Random.Seed, Table user v)
 genSeed (Table seed table) =
     Random.step (Random.int Random.minInt Random.maxInt) seed
         |> \(randInt, newSeed) ->
             ( Random.initialSeed randInt, Table newSeed table )
 
--- get : Id user -> Ulid v -> Table user v -> Maybe v
--- get userId (Ulid ulid) (Table _ table) =
---     Dict.get ulid table
---         |> Maybe.andThen (\{value, reader, writer} ->
---             if UlidSet.member userId reader || UlidSet.member userId writer then
---                 Just value
---             else
---                 Nothing
---         )
+
+get : Id user -> Ulid v -> Table user v -> Maybe v
+get userId (Ulid ulid) (Table _ table) =
+    Dict.get ulid table
+        |> Maybe.andThen (\{value, readers, writers} ->
+            if UlidSet.member userId readers || UlidSet.member userId writers then
+                Just value
+            else
+                Nothing
+        )
 
 -- {-| Returns a bool showing if the user had auth to edit the value
 --     Dont modify the table if the user does not have auth
@@ -163,8 +202,8 @@ genSeed (Table seed table) =
 --             , Dict.insert
 --                 ulid
 --                 { value = newVal
---                 , writer = UlidSet.singleton userId
---                 , reader = UlidSet.empty
+--                 , writers = UlidSet.singleton userId
+--                 , readers = UlidSet.empty
 --                 }
 --                 table
 --                 |> Table seed
@@ -173,11 +212,11 @@ genSeed (Table seed table) =
 --             )
 
 --         Just value ->
---             if UlidSet.member userId value.writer then
+--             if UlidSet.member userId value.writers then
 --                 ( True
 --                 , Dict.insert ulid { value | value = newVal } table
 --                     |> Table seed
---                 , [( UlidSet.union value.writer value.reader, (Ulid ulid, External, Update newVal))]
+--                 , [( UlidSet.union value.writers value.readers, (Ulid ulid, External, Update newVal))]
 --                     |> DistributeToFrontend
 --                 )
 
