@@ -1,29 +1,31 @@
-module Sync.Frontend.Table exposing
+module Sync.Frontend exposing
     ( Table(..), Value, Remote(..)
+    , empty
     , add, insert, remove
     , get, optimisticGet, completeGet
     , isLoading
     , request
-    , fromBackend
+    , updateFromBackend
     )
 
-import Dict exposing (Dict)
 import Random.NoOpaqueType as Random
 import Time.NoOpaqueType as Time
-import Ulid exposing (Ulid(..))
-import Sync.Table exposing (..)
-import Ulid exposing (Ulid(..))
-import Dict
+import Sync exposing (..)
+import Ulid exposing (Ulid)
 import Id exposing (Id(..))
 import IdDict exposing (IdTable)
+import UlidDict exposing (UlidDict)
 
-type Table v
-    = Table Random.Seed (Dict String (Value v))
+
+type Table k v
+    = Table (UlidDict k (Value v))
+
 
 type alias Value v =
     { remote : Remote v
     , local : IdTable (Operation v)
     }
+
 
 type Remote v
     = Loading
@@ -31,98 +33,95 @@ type Remote v
     | RemoteDeleted
 
 
-add : v -> Table v -> Time.Posix -> ( Ulid v, Table v, ToBackend v )
-add val (Table seed table) now =
+empty : Table k v
+empty =
+    Table UlidDict.empty
+
+
+add :
+    v
+    -> Table k v
+    -> Random.Seed
+    -> Time.Posix
+    -> { newValId : Ulid k
+       , newTable : Table k v
+       , toBackend : ToBackend k v
+       , newSeed : Random.Seed
+       }
+add val (Table table) seed now =
     let
         (ulid, newSeed) =
-            Random.step (Ulid.stringGenerator now) seed
+            Ulid.new seed now
+
+        (opId, newLocal) =
+            IdDict.add (Create val) IdDict.empty
+
+        newValue =
+            { local = newLocal
+            , remote = Loading
+            }
     in
-    if Dict.member ulid table then
-        -- this should never happen but we secure against ulid collision anyway
-        if (Dict.get ulid table |> Maybe.andThen pendingOp) == Just (Create val) then
-            (Ulid ulid, Table newSeed table, emptyToBack)
-
-        else
-            -- TODO track when this happens and report it, it should come from an issue in the code
-            add val (Table newSeed table) now
-            |> (\(ulid_, table_, ToBackend toBackend) ->
-                (ulid_, table_, ToBackend { toBackend | requestSeed = True })
-            )
-
-    else
-        let
-            (opId, newLocal) =
-                IdDict.add (Create val) IdDict.empty
-
-            newValue =
-                { local = newLocal
-                , remote = Loading
-                }
-        in
-        ( Ulid ulid
-        , Dict.insert ulid newValue table |> Table newSeed
-        , toBack (Ulid ulid, opId, Create val)
-        )
+    { newValId = ulid
+    , newTable = UlidDict.insert ulid newValue table |> Table
+    , toBackend = toBack (ulid, opId, Create val)
+    , newSeed = newSeed
+    }
 
 
-insert : Ulid v -> v -> Table v -> (Table v, ToBackend v)
-insert (Ulid ulid) val (Table seed table) =
-    case Dict.get ulid table of
+insert : Ulid k -> v -> Table k v -> { newTable : Table k v, toBackend : ToBackend k v }
+insert ulid newVal (Table table) =
+    case UlidDict.get ulid table of
         Nothing ->
             let
                 (opId, newLocal) =
-                    IdDict.add (Create val) IdDict.empty
+                    IdDict.add (Create newVal) IdDict.empty
             in
-            ( Dict.insert ulid { local = newLocal, remote = Loading } table
-                |> Table seed
-            , toBack (Ulid ulid, opId, Create val)
-            )
+            { newTable = UlidDict.insert ulid { local = newLocal, remote = Loading } table |> Table
+            , toBackend = toBack (ulid, opId, Create newVal)
+            }
 
         Just value ->
-            if pendingOp value == Just (Update val) then
-                (Table seed table, emptyToBack)
+            if pendingOp value == Just (Update newVal) then
+                { newTable = Table table, toBackend = emptyToBack }
             else
                 let
                     (opId, newLocal) =
-                        IdDict.add (Update val) value.local
+                        IdDict.add (Update newVal) value.local
                 in
-                ( Dict.insert ulid { value | local = newLocal } table
-                    |> Table seed
-                , toBack (Ulid ulid, opId, Update val)
-                )
+                { newTable = UlidDict.insert ulid { value | local = newLocal } table |> Table
+                , toBackend = toBack (ulid, opId, Update newVal)
+                }
 
 
-remove : Ulid v -> Table v -> (Table v, ToBackend v)
-remove (Ulid ulid) (Table seed table) =
-    case Dict.get ulid table of
+remove : Ulid k -> Table k v -> { newTable : Table k v, toBackend : ToBackend k v }
+remove ulid (Table table) =
+    case UlidDict.get ulid table of
         Nothing ->
             let
                 (opId, newLocal) =
                     IdDict.add Delete IdDict.empty
             in
-            ( Dict.insert ulid { local = newLocal, remote = Loading } table
-                |> Table seed
-            , toBack (Ulid ulid, opId, Delete)
-            )
+            { newTable = UlidDict.insert ulid { local = newLocal, remote = Loading } table |> Table
+            , toBackend = toBack (ulid, opId, Delete)
+            }
 
         Just value ->
             if pendingOp value == Just Delete then
-                (Table seed table, emptyToBack)
+                { newTable = Table table, toBackend = emptyToBack }
 
             else
                 let
                     (opId, newLocal) =
                         IdDict.add Delete value.local
                 in
-                ( Dict.insert ulid { value | local = newLocal } table
-                    |> Table seed
-                , toBack (Ulid ulid, opId, Delete)
-                )
+                { newTable = UlidDict.insert ulid { value | local = newLocal } table |> Table
+                , toBackend = toBack (ulid, opId, Delete)
+                }
 
 
-get : Ulid v -> Table v -> Maybe v
-get (Ulid ulid) (Table _ table) =
-    Dict.get ulid table
+get : Ulid k -> Table k v -> Maybe v
+get ulid (Table table) =
+    UlidDict.get ulid table
         |> Maybe.andThen (\value ->
             case value.remote of
                 Received val ->
@@ -133,9 +132,9 @@ get (Ulid ulid) (Table _ table) =
         )
 
 
-isLoading : Ulid v -> Table v -> Bool
-isLoading (Ulid ulid) (Table _ table) =
-    Dict.get ulid table
+isLoading : Ulid k -> Table k v -> Bool
+isLoading ulid (Table table) =
+    UlidDict.get ulid table
         |> Maybe.map
             (\value ->
                 value.remote == Loading || not (IdDict.isEmpty value.local)
@@ -143,8 +142,8 @@ isLoading (Ulid ulid) (Table _ table) =
         |> Maybe.withDefault False
 
 
-optimisticGet : Ulid v -> Table v -> Maybe v
-optimisticGet (Ulid ulid) (Table _ table) =
+optimisticGet : Ulid k -> Table k v -> Maybe v
+optimisticGet ulid (Table table) =
     Maybe.andThen
         (\value ->
             case value.remote of
@@ -168,35 +167,34 @@ optimisticGet (Ulid ulid) (Table _ table) =
                                     Nothing
                         )
         )
-        (Dict.get ulid table)
+        (UlidDict.get ulid table)
 
 
-completeGet : Ulid v -> Table v -> Maybe (Value v)
-completeGet (Ulid ulid) (Table _ table) =
-    Dict.get ulid table
+completeGet : Ulid k -> Table k v -> Maybe (Value v)
+completeGet ulid (Table table) =
+    UlidDict.get ulid table
 
 
 {-| Pull the value from the server if it isn't already present.
 -}
-request : Ulid v -> Table v -> (Table v, ToBackend v)
-request (Ulid ulid) (Table seed table) =
-    case Dict.get ulid table of
+request : Ulid k -> Table k v -> { newTable : Table k v, toBackend : ToBackend k v }
+request ulid (Table table) =
+    case UlidDict.get ulid table of
         Just _ ->
-            (Table seed table, emptyToBack)
+            { newTable = Table table, toBackend = emptyToBack }
 
         Nothing ->
             let
                 (opId, newLocal) =
                     IdDict.add Read IdDict.empty
             in
-            ( Dict.insert ulid { local = newLocal, remote = Loading } table
-                |> Table seed
-            , toBack (Ulid ulid, opId, Read)
-            )
+            { newTable = UlidDict.insert ulid { local = newLocal, remote = Loading } table |> Table
+            , toBackend = toBack (ulid, opId, Read)
+            }
 
 
-fromBackend : ToFrontend v -> Table v -> Table v
-fromBackend (ToFrontend toFrontend) (Table seed table) =
+updateFromBackend : ToFrontend k v -> Table k v -> Table k v
+updateFromBackend (ToFrontend operations) (Table table) =
     let
         updateNonExisting valid op =
             case (valid, op) of
@@ -257,8 +255,8 @@ fromBackend (ToFrontend toFrontend) (Table seed table) =
                     Just value
     in
     List.foldl
-        (\(Ulid ulid, valid, op) runTable ->
-            Dict.update
+        (\(ulid, valid, op) runTable ->
+            UlidDict.update
                 ulid
                 ( Maybe.map (updateExisting valid op)
                 >> Maybe.withDefault (updateNonExisting valid op)
@@ -266,8 +264,8 @@ fromBackend (ToFrontend toFrontend) (Table seed table) =
                 runTable
         )
         table
-        toFrontend.operations
-        |> Table (Maybe.withDefault seed toFrontend.newSeed)
+        operations
+        |> Table
 
 
 -- Internal
@@ -279,13 +277,11 @@ pendingOp value =
     |> Maybe.map Tuple.second
 
 
-toBack : (Ulid v, Id (Operation v), Operation v) -> ToBackend v
+toBack : (Ulid k, Id (Operation v), Operation v) -> ToBackend k v
 toBack (ulid, opId, op) =
-    { operations = [(ulid, opId, op)], requestSeed = False }
-    |> ToBackend
+    [(ulid, opId, op)] |> ToBackend
 
 
-emptyToBack : ToBackend v
+emptyToBack : ToBackend k v
 emptyToBack =
-    { operations = [], requestSeed = False }
-    |> ToBackend
+    ToBackend []
