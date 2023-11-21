@@ -28,7 +28,7 @@ type Access user
 type alias NeedProcessing user k v =
     { response : ToFrontend k v
     , addToListening : UlidSet k
-    , changes : UlidSet k
+    , changes : UlidDict k (Operation v)
     , newTable : Table user k v
     }
 
@@ -36,6 +36,7 @@ type alias NeedProcessing user k v =
 type Auth user
     = User (Ulid user)
     | Admin
+    | Anonymous
 
 
 empty : Table user k v
@@ -57,8 +58,8 @@ updateFromFrontend sanitize auth (ToBackend toBackend) initTable =
                     let
                         sainVal = sanitize newVal
                     in
-                    { response = insertToFront (ulid, Accepted opId, Create sainVal) needProc.response
-                    , changes = UlidSet.insert ulid needProc.changes
+                    { response = insertToFrontend (ulid, Accepted opId, Create sainVal) needProc.response
+                    , changes = UlidDict.insert ulid (Create sainVal) needProc.changes
                     , addToListening = UlidSet.insert ulid needProc.addToListening
                     , newTable =
                         UlidDict.insert
@@ -92,22 +93,22 @@ updateFromFrontend sanitize auth (ToBackend toBackend) initTable =
                         let
                             sainVal = sanitize newVal
                         in
-                        { response = insertToFront (ulid, Accepted opId, Update sainVal) needProc.response
-                        , changes = UlidSet.insert ulid needProc.changes
+                        { response = insertToFrontend (ulid, Accepted opId, Update sainVal) needProc.response
+                        , changes = UlidDict.insert ulid (Update sainVal) needProc.changes
                         , addToListening = UlidSet.insert ulid needProc.addToListening
                         , newTable = UlidDict.insert ulid { value | value = Just sainVal } table |> Table
                         }
 
                     else
-                        { needProc | response = insertToFront (ulid, Rejected opId, op) needProc.response }
+                        { needProc | response = insertToFrontend (ulid, Rejected opId, op) needProc.response }
 
                 (Just value, Delete) ->
                     if value.value == Nothing then
                         noVal (ulid, opId, op) needProc
 
                     else if hasWriteAccess auth value then
-                        { response = insertToFront (ulid, Accepted opId, Delete) needProc.response
-                        , changes = UlidSet.insert ulid needProc.changes
+                        { response = insertToFrontend (ulid, Accepted opId, Delete) needProc.response
+                        , changes = UlidDict.insert ulid Delete needProc.changes
                         , addToListening = UlidSet.insert ulid needProc.addToListening
                         , newTable =
                             UlidDict.insert
@@ -128,7 +129,7 @@ updateFromFrontend sanitize auth (ToBackend toBackend) initTable =
                         Just val ->
                             if hasReadAccess auth value then
                                 { needProc
-                                | response = insertToFront (ulid, Accepted opId, Update val ) needProc.response
+                                | response = insertToFrontend (ulid, Accepted opId, Update val ) needProc.response
                                 , addToListening = UlidSet.insert ulid needProc.addToListening
                                 }
 
@@ -140,15 +141,15 @@ updateFromFrontend sanitize auth (ToBackend toBackend) initTable =
             { needProc
             | response =
                 needProc.response
-                |> insertToFront (ulid, Rejected opId, op)
-                |> insertToFront (ulid, External, Delete)
+                |> insertToFrontend (ulid, Rejected opId, op)
+                |> insertToFrontend (ulid, External, Delete)
             }
     in
     List.foldl
         buildUp
-        { response = emptyToFront
+        { response = emptyToFrontend
         , addToListening = UlidSet.empty
-        , changes = UlidSet.empty
+        , changes = UlidDict.empty
         , newTable = initTable
         }
         (List.sortBy (\(_, Id opId, _) -> opId) toBackend)
@@ -164,6 +165,9 @@ hasReadAccess auth value =
                     UlidSet.member userId readSet
     in
     case auth of
+        Anonymous ->
+            value.readers == Public
+
         Admin ->
             True
 
@@ -174,6 +178,9 @@ hasReadAccess auth value =
 hasWriteAccess : Auth user -> Value user v -> Bool
 hasWriteAccess auth { owner, writers } =
     case auth of
+        Anonymous ->
+            False
+
         Admin ->
             True
 
@@ -187,7 +194,7 @@ forwardChanges userId listening {changes} table =
         operations =
             UlidSet.foldl
                 (\listeningId opAcc->
-                    if not (UlidSet.member listeningId changes) then
+                    if not (UlidDict.member listeningId changes) then
                         opAcc
                     else
                         case get userId listeningId table of
@@ -237,14 +244,3 @@ find userId predicate (Table table) =
         )
         Nothing
         table
-
-
--- Internal
-
-emptyToFront : ToFrontend k v
-emptyToFront =
-    ToFrontend []
-
-insertToFront : (Ulid k, Validation v, Operation v) -> ToFrontend k v -> ToFrontend k v
-insertToFront row (ToFrontend operations) =
-    ToFrontend (row :: operations)

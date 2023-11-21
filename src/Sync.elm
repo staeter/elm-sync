@@ -45,6 +45,21 @@ batchToFrontend =
         >> ToFrontend
 
 
+isToFrontendEmpty : ToFrontend k v -> Bool
+isToFrontendEmpty (ToFrontend operations) =
+    List.isEmpty operations
+
+
+emptyToFrontend : ToFrontend k v
+emptyToFrontend =
+    ToFrontend []
+
+
+insertToFrontend : (Ulid k, Validation v, Operation v) -> ToFrontend k v -> ToFrontend k v
+insertToFrontend row (ToFrontend operations) =
+    ToFrontend (row :: operations)
+
+
 -- lamdera
 
 type alias ClientId = String
